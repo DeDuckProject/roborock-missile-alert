@@ -50,6 +50,26 @@ class TestRoundRobin:
         assert scheduler.get_next_room([]) is None
 
 
+class TestSelectionStrategy:
+    def test_oldest_cleaned_picks_never_cleaned_first(self, state_file):
+        s = RoomScheduler(state_file=state_file, selection_strategy="oldest_cleaned")
+        rooms = [{"id": 1, "name": "A"}, {"id": 2, "name": "B"}]
+        s.mark_cleaned(1)
+        room = s.get_next_room(rooms)
+        assert room is not None
+        assert room["id"] == 2
+
+    def test_oldest_cleaned_picks_farthest_clean_time(self, state_file):
+        s = RoomScheduler(state_file=state_file, selection_strategy="oldest_cleaned", cooldown_hours=0)
+        rooms = [{"id": 1, "name": "A"}, {"id": 2, "name": "B"}]
+        now = datetime.now(timezone.utc)
+        s._state["last_cleaned"]["1"] = (now - timedelta(hours=1)).isoformat()
+        s._state["last_cleaned"]["2"] = (now - timedelta(hours=3)).isoformat()
+        room = s.get_next_room(rooms)
+        assert room is not None
+        assert room["id"] == 2
+
+
 # ---------------------------------------------------------------------------
 # Mamad exclusion
 # ---------------------------------------------------------------------------
@@ -62,6 +82,14 @@ class TestMamadExclusion:
             room = scheduler.get_next_room(rooms)
             assert room is not None
             assert room["name"] != name
+
+    @pytest.mark.parametrize("name", [' ממ"ד ', "מ מ ד", "ממ׳ד", "ממ`ד"])
+    def test_excludes_mamad_normalized_variants(self, scheduler, name):
+        rooms = [{"id": 1, "name": "Kitchen"}, {"id": 2, "name": name}]
+        for _ in range(10):
+            room = scheduler.get_next_room(rooms)
+            assert room is not None
+            assert room["id"] == 1
 
     def test_does_not_exclude_partial_match(self, scheduler):
         rooms = [{"id": 1, "name": "Corridor (mamad side)"}]
@@ -269,3 +297,7 @@ class TestStoredConfig:
         s.save()
         s2 = RoomScheduler(state_file=state_file)
         assert s2.get_areas() == ["תל אביב"]
+
+    def test_set_and_get_cleaning_profile(self, scheduler):
+        scheduler.set_cleaning_profile("vacuum_only")
+        assert scheduler.get_cleaning_profile() == "vacuum_only"

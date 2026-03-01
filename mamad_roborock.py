@@ -40,6 +40,7 @@ from vacuum_controller import (
     STATUS_OK,
     STATUS_ALREADY_CLEANING,
 )
+from dreame_controller import DreameController
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -92,6 +93,46 @@ def _load_config(path: str) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 _FILTER_MAX_SHOWN = 8
+
+_CLEANING_PROFILES = {
+    "auto": "Keep robot/app default",
+    "vacuum_only": "Vacuum only (no mopping)",
+    "mop_only": "Mop only",
+    "vacuum_and_mop": "Vacuum + mop together",
+    "mop_after_vacuum": "Mop after vacuum",
+}
+
+
+def _prompt_with_default(prompt: str, default: str) -> str:
+    raw = input(f"{prompt} [{default}]: ").strip()
+    return raw or default
+
+
+def _normalize_cleaning_profile(value: str) -> str:
+    profile = (value or "auto").strip().lower()
+    aliases = {
+        "1": "auto",
+        "2": "vacuum_only",
+        "3": "mop_only",
+        "4": "vacuum_and_mop",
+        "5": "mop_after_vacuum",
+    }
+    profile = aliases.get(profile, profile)
+    if profile not in _CLEANING_PROFILES:
+        return "auto"
+    return profile
+
+
+def _prompt_cleaning_profile(default: str) -> str:
+    print("\n--- Cleaning Behavior ---")
+    print("Choose what to do when an alert triggers cleaning:")
+    print("  1. Keep robot/app default")
+    print("  2. Vacuum only (no mopping)")
+    print("  3. Mop only")
+    print("  4. Vacuum + mop together")
+    print("  5. Mop after vacuum")
+    value = _prompt_with_default("Select cleaning behavior (1-5 or name)", default)
+    return _normalize_cleaning_profile(value)
 
 
 def _prompt_areas(existing: List[str] = None, known_areas: List[str] = None) -> List[str]:
@@ -230,12 +271,18 @@ class MamadService:
             cooldown_hours=float(cfg.get("cooldown_hours", 1.0)),
             max_cleans_per_window=int(cfg.get("max_cleans_per_room", 2)),
             clean_window_hours=float(cfg.get("clean_window_hours", 12.0)),
+            selection_strategy=cfg.get("room_selection_strategy", "round_robin"),
         )
-        self.vacuum = VacuumController(
-            min_battery_percent=int(cfg.get("min_battery_percent", 20)),
-        )
+        self.vacuum_type = cfg.get("vacuum_type") or self.scheduler.get_vacuum_type()
+        if self.vacuum_type == "dreame":
+            self.vacuum = DreameController(min_battery_percent=int(cfg.get("min_battery_percent", 20)))
+        else:
+            self.vacuum = VacuumController(min_battery_percent=int(cfg.get("min_battery_percent", 20)))
         self.notifier = Notifier(cfg.get("notifications", {}))
         self.alert_monitor: Optional[AlertMonitor] = None
+        configured_profile = cfg.get("cleaning_profile")
+        state_profile = self.scheduler.get_cleaning_profile()
+        self.cleaning_profile = _normalize_cleaning_profile(configured_profile or state_profile or "auto")
 
     # ------------------------------------------------------------------
     # Setup mode
@@ -243,23 +290,82 @@ class MamadService:
 
     async def run_setup(self) -> None:
         """Interactive first-run: auth, discover rooms, print them."""
-        log.info("=== MAMAD Roborock Setup ===")
+        log.info("=== MAMAD Vacuum Setup ===")
 
-        # Use stored email if available, otherwise prompt
-        email = self.scheduler.get_email()
-        if not email:
-            email = input("Enter your Roborock account email: ").strip()
+        print("Which vacuum brand do you have?")
+        print("  1. Roborock")
+        print("  2. Dreame")
+        choice = input("Enter choice (1 or 2): ").strip()
+
+        if choice == "2":
+            self.vacuum_type = "dreame"
+            self.scheduler.set_vacuum_type("dreame")
+            self.vacuum = DreameController(min_battery_percent=int(self.cfg.get("min_battery_percent", 20)))
+
+            username = self.scheduler.get_dreame_username()
+            if not username:
+                username = input("Enter your Xiaomi account email or phone (for Dreame): ").strip()
+                if not username:
+                    sys.exit("ERROR: Username is required")
+
+            account_type = _prompt_with_default(
+                "Enter Dreame account type (mi/dreame)",
+                self.scheduler.get_dreame_account_type(),
+            ).lower()
+            if account_type not in {"mi", "dreame"}:
+                sys.exit("ERROR: Dreame account type must be 'mi' or 'dreame'")
+
+            default_country = self.scheduler.get_dreame_country()
+            if account_type == "dreame" and default_country == "cn":
+                default_country = "eu"
+            if account_type == "dreame":
+                print("Tip: Dreamehome app routes Israel (IL) to region 'sg'.")
+            country = _prompt_with_default(
+                "Enter Dreame cloud country/region (e.g. de/us/cn)",
+                default_country,
+            ).lower()
+            if not country:
+                sys.exit("ERROR: Country is required")
+
+            creds = await self.vacuum.setup(
+                username=username,
+                country=country,
+                account_type=account_type,
+                cached_credentials=self.scheduler.get_cached_credentials(),
+                interactive=True,
+            )
+            self.scheduler.set_dreame_username(username)
+            self.scheduler.set_dreame_account_type(account_type)
+            self.scheduler.set_dreame_country(country)
+            self.scheduler.set_cached_credentials(creds)
+            self.scheduler.save()
+        else:
+            self.vacuum_type = "roborock"
+            self.scheduler.set_vacuum_type("roborock")
+            self.vacuum = VacuumController(min_battery_percent=int(self.cfg.get("min_battery_percent", 20)))
+
+            # Use stored email if available, otherwise prompt
+            email = self.scheduler.get_email()
             if not email:
-                sys.exit("ERROR: Email is required")
+                email = input("Enter your Roborock account email: ").strip()
+                if not email:
+                    sys.exit("ERROR: Email is required")
 
-        creds = await self.vacuum.setup(
-            email=email,
-            cached_credentials=self.scheduler.get_cached_credentials(),
-            interactive=True,
-        )
-        self.scheduler.set_email(email)
-        self.scheduler.set_cached_credentials(creds)
+            creds = await self.vacuum.setup(
+                email=email,
+                cached_credentials=self.scheduler.get_cached_credentials(),
+                interactive=True,
+            )
+            self.scheduler.set_email(email)
+            self.scheduler.set_cached_credentials(creds)
+            self.scheduler.save()
+
+        default_profile = _normalize_cleaning_profile(self.scheduler.get_cleaning_profile() or self.cleaning_profile)
+        selected_profile = _prompt_cleaning_profile(default_profile)
+        self.cleaning_profile = selected_profile
+        self.scheduler.set_cleaning_profile(selected_profile)
         self.scheduler.save()
+        print(f"Selected cleaning behavior: {selected_profile} — {_CLEANING_PROFILES[selected_profile]}")
 
         # Areas setup — show known cities before prompting so the user can verify spelling
         print("\nFetching available city/area names from Pikud HaOref...")
@@ -299,20 +405,38 @@ class MamadService:
 
     async def run(self) -> None:
         """Daemon: authenticate, check state, then monitor alerts."""
-        log.info("=== MAMAD Roborock starting (daemon mode) ===")
+        log.info("=== MAMAD Vacuum starting (daemon mode) ===")
 
-        # Auth — email is stored in state file after first --setup run
-        email = self.scheduler.get_email()
-        if not email:
-            sys.exit(
-                "ERROR: No Roborock account found in state file.\n"
-                "Run setup first:  python mamad_roborock.py --setup"
+        # Auth
+        if self.vacuum_type == "dreame":
+            username = self.scheduler.get_dreame_username()
+            if not username:
+                sys.exit(
+                    "ERROR: No Xiaomi/Dreame account found in state file.\n"
+                    "Run setup first:  python mamad_roborock.py --setup"
+                )
+            country = self.scheduler.get_dreame_country()
+            account_type = self.scheduler.get_dreame_account_type()
+            creds = await self.vacuum.setup(
+                username=username,
+                country=country,
+                account_type=account_type,
+                cached_credentials=self.scheduler.get_cached_credentials(),
+                interactive=False,
             )
-        creds = await self.vacuum.setup(
-            email=email,
-            cached_credentials=self.scheduler.get_cached_credentials(),
-            interactive=False,
-        )
+        else:
+            email = self.scheduler.get_email()
+            if not email:
+                sys.exit(
+                    "ERROR: No Roborock account found in state file.\n"
+                    "Run setup first:  python mamad_roborock.py --setup"
+                )
+            creds = await self.vacuum.setup(
+                email=email,
+                cached_credentials=self.scheduler.get_cached_credentials(),
+                interactive=False,
+            )
+
         self.scheduler.set_cached_credentials(creds)
         self.scheduler.save()
 
@@ -469,7 +593,12 @@ class MamadService:
         )
 
         try:
-            await self.vacuum.start_segment_clean(room["id"], fan_speed=fan_speed)
+            if self.cleaning_profile == "auto":
+                await self.vacuum.start_segment_clean(room["id"], fan_speed=fan_speed)
+            else:
+                await self.vacuum.start_segment_clean(
+                    room["id"], fan_speed=fan_speed, cleaning_profile=self.cleaning_profile
+                )
             log.info("Cleaning started — waiting %.0f seconds", duration_seconds)
             await asyncio.sleep(duration_seconds)
             log.info("Clean duration elapsed — stopping")
@@ -645,15 +774,28 @@ async def _run_test_clean(self, room_id: int) -> None:
     """Connect, clean one room for 30 s, then dock. Used by --test-clean."""
     print(f"\nTest clean: room id={room_id} for 30 seconds\n")
 
-    email = self.scheduler.get_email()
-    if not email:
-        sys.exit("ERROR: Run --setup first")
+    if self.vacuum_type == "dreame":
+        username = self.scheduler.get_dreame_username()
+        if not username:
+            sys.exit("ERROR: Run --setup first")
+        await self.vacuum.setup(
+            username=username,
+            country=self.scheduler.get_dreame_country(),
+            account_type=self.scheduler.get_dreame_account_type(),
+            cached_credentials=self.scheduler.get_cached_credentials(),
+            interactive=False,
+        )
+    else:
+        email = self.scheduler.get_email()
+        if not email:
+            sys.exit("ERROR: Run --setup first")
 
-    await self.vacuum.setup(
-        email=email,
-        cached_credentials=self.scheduler.get_cached_credentials(),
-        interactive=False,
-    )
+        await self.vacuum.setup(
+            email=email,
+            cached_credentials=self.scheduler.get_cached_credentials(),
+            interactive=False,
+        )
+
     await self.vacuum.discover_devices()
 
     status = await self.vacuum.get_status()
@@ -668,7 +810,14 @@ async def _run_test_clean(self, room_id: int) -> None:
         sys.exit(f"ERROR: Room id={room_id} not found. Available: {available}")
 
     print(f"Starting segment clean: {room['name']} (id={room_id})")
-    await self.vacuum.start_segment_clean(room_id, fan_speed=self.cfg.get("fan_speed", "balanced"))
+    if self.cleaning_profile == "auto":
+        await self.vacuum.start_segment_clean(room_id, fan_speed=self.cfg.get("fan_speed", "balanced"))
+    else:
+        await self.vacuum.start_segment_clean(
+            room_id,
+            fan_speed=self.cfg.get("fan_speed", "balanced"),
+            cleaning_profile=self.cleaning_profile,
+        )
 
     print("Cleaning for 30 seconds...")
     await asyncio.sleep(30)
@@ -696,15 +845,28 @@ async def _run_inject_alert(self, city: str) -> None:
     print(f"\nInjecting synthetic alert for city: '{city}'")
     print("This runs the full alert → vacuum pipeline.\n")
 
-    email = self.scheduler.get_email()
-    if not email:
-        sys.exit("ERROR: Run --setup first")
+    if self.vacuum_type == "dreame":
+        username = self.scheduler.get_dreame_username()
+        if not username:
+            sys.exit("ERROR: Run --setup first")
+        creds = await self.vacuum.setup(
+            username=username,
+            country=self.scheduler.get_dreame_country(),
+            account_type=self.scheduler.get_dreame_account_type(),
+            cached_credentials=self.scheduler.get_cached_credentials(),
+            interactive=False,
+        )
+    else:
+        email = self.scheduler.get_email()
+        if not email:
+            sys.exit("ERROR: Run --setup first")
 
-    creds = await self.vacuum.setup(
-        email=email,
-        cached_credentials=self.scheduler.get_cached_credentials(),
-        interactive=False,
-    )
+        creds = await self.vacuum.setup(
+            email=email,
+            cached_credentials=self.scheduler.get_cached_credentials(),
+            interactive=False,
+        )
+
     self.scheduler.set_cached_credentials(creds)
     self.scheduler.save()
 

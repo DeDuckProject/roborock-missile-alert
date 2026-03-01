@@ -182,8 +182,10 @@ All options live in `config.yaml` (excluded from git):
 | `alert_types` | `["1"]` | Alert categories to react to (`"1"` = missiles/rockets) |
 | `clean_duration_minutes` | `10` | How long to clean per alert |
 | `fan_speed` | `balanced` | Fan speed: `quiet`, `balanced`, `turbo`, `max`, `max_plus` |
+| `cleaning_profile` | `auto` | Cleaning behavior: `auto`, `vacuum_only`, `mop_only`, `vacuum_and_mop`, `mop_after_vacuum` |
 | `exclude_rooms` | `[]` | Room name substrings to exclude from rotation (in addition to Mamad) |
 | `cooldown_hours` | `1` | Minimum hours between cleans of the same room |
+| `room_selection_strategy` | `round_robin` | Room selection mode: `round_robin` or `oldest_cleaned` |
 | `min_battery_percent` | `20` | Skip cleaning if battery is below this level |
 | `notifications.enabled` | `false` | Enable Telegram or ntfy notifications |
 | `log_level` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |

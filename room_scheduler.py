@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import stat
+import unicodedata
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Any, Optional
 
@@ -54,6 +55,7 @@ class RoomScheduler:
         room_cache_hours: float = 24.0,
         max_cleans_per_window: int = 2,
         clean_window_hours: float = 12.0,
+        selection_strategy: str = "round_robin",
     ) -> None:
         self.state_file = state_file
         self.exclude_rooms = [r.lower() for r in (exclude_rooms or [])]
@@ -61,6 +63,10 @@ class RoomScheduler:
         self.room_cache_hours = room_cache_hours
         self.max_cleans_per_window = max_cleans_per_window
         self.clean_window_hours = clean_window_hours
+        self.selection_strategy = (selection_strategy or "round_robin").strip().lower()
+        if self.selection_strategy not in {"round_robin", "oldest_cleaned"}:
+            log.warning("Unknown selection_strategy=%r, falling back to round_robin", self.selection_strategy)
+            self.selection_strategy = "round_robin"
         self._state: Dict[str, Any] = {}
         self._load()
 
@@ -83,6 +89,21 @@ class RoomScheduler:
         if not eligible:
             log.warning("All rooms are on cooldown, rate-limited, or excluded — skipping")
             return None
+
+        if self.selection_strategy == "oldest_cleaned":
+            room = min(
+                eligible,
+                key=lambda r: (
+                    self._last_cleaned_dt(r["id"]) or datetime.min.replace(tzinfo=timezone.utc),
+                    int(r["id"]),
+                ),
+            )
+            log.info(
+                "Selected room id=%s name=%s (strategy=oldest_cleaned)",
+                room["id"],
+                room["name"],
+            )
+            return room
 
         idx = self._state.get("round_robin_index", 0) % len(eligible)
         room = eligible[idx]
@@ -127,6 +148,30 @@ class RoomScheduler:
     def set_email(self, email: str) -> None:
         self._state["roborock_email"] = email
 
+    def get_dreame_username(self) -> Optional[str]:
+        return self._state.get("dreame_username")
+
+    def set_dreame_username(self, username: str) -> None:
+        self._state["dreame_username"] = username
+
+    def get_dreame_country(self) -> str:
+        return self._state.get("dreame_country", "cn")
+
+    def set_dreame_country(self, country: str) -> None:
+        self._state["dreame_country"] = (country or "cn").strip().lower()
+
+    def get_dreame_account_type(self) -> str:
+        return self._state.get("dreame_account_type", "mi")
+
+    def set_dreame_account_type(self, account_type: str) -> None:
+        self._state["dreame_account_type"] = (account_type or "mi").strip().lower()
+
+    def get_vacuum_type(self) -> Optional[str]:
+        return self._state.get("vacuum_type", "roborock")
+
+    def set_vacuum_type(self, vtype: str) -> None:
+        self._state["vacuum_type"] = vtype
+
     def get_cached_credentials(self) -> Dict:
         return self._state.get("roborock_cached_credentials", {})
 
@@ -138,6 +183,12 @@ class RoomScheduler:
 
     def set_areas(self, areas: List[str]) -> None:
         self._state["areas"] = areas
+
+    def get_cleaning_profile(self) -> str:
+        return self._state.get("cleaning_profile", "auto")
+
+    def set_cleaning_profile(self, profile: str) -> None:
+        self._state["cleaning_profile"] = (profile or "auto").strip().lower()
 
     def get_last_alert_id(self) -> Optional[str]:
         return self._state.get("last_alert_id")
@@ -199,13 +250,39 @@ class RoomScheduler:
             "last_alert_id": None,
             "last_alert_time": None,
             "roborock_email": None,
+            "dreame_username": None,
+            "dreame_country": "cn",
+            "dreame_account_type": "mi",
+            "vacuum_type": "roborock",
+            "cleaning_profile": "auto",
             "roborock_cached_credentials": {},
             "areas": [],
         }
 
-    # Exact names (case-insensitive) that are always excluded — the safe room
-    # should never be cleaned during an alert.
+    # Exact names that are always excluded — the safe room should never be
+    # cleaned during an alert.
     _MAMAD_NAMES = {"mamad", "ממד", 'ממ"ד', "ממ״ד"}
+    _MAMAD_NORMALIZED = None
+
+    @staticmethod
+    def _normalize_room_name(name: str) -> str:
+        """
+        Normalize room names for robust exact matching across quote/Unicode variants.
+        """
+        if not isinstance(name, str):
+            return ""
+
+        normalized = unicodedata.normalize("NFKC", name).strip().lower()
+        # Remove Hebrew/ASCII quote variants and whitespace for stable comparison.
+        for ch in ['"', "'", "״", "׳", "`", "’", "“", "”", " "]:
+            normalized = normalized.replace(ch, "")
+        return normalized
+
+    @classmethod
+    def _is_mamad_room(cls, name: str) -> bool:
+        if cls._MAMAD_NORMALIZED is None:
+            cls._MAMAD_NORMALIZED = {cls._normalize_room_name(n) for n in cls._MAMAD_NAMES}
+        return cls._normalize_room_name(name) in cls._MAMAD_NORMALIZED
 
     def _clean_count_in_window(self, room_id: int) -> int:
         """Return the number of times *room_id* was cleaned within clean_window_hours."""
@@ -219,6 +296,10 @@ class RoomScheduler:
             self._state.setdefault("clean_history", {})[str(room_id)] = recent
         return len(recent)
 
+    def _last_cleaned_dt(self, room_id: int) -> Optional[datetime]:
+        ts = self._state.get("last_cleaned", {}).get(str(room_id))
+        return _parse_iso(ts)
+
     def _eligible_rooms(self, rooms: List[Dict]) -> List[Dict]:
         """Filter rooms: remove excluded names, rooms on cooldown, and rate-limited rooms."""
         now = datetime.now(timezone.utc)
@@ -227,7 +308,7 @@ class RoomScheduler:
         for room in rooms:
             name = room.get("name", "")
             # Always exclude the mamad (safe room)
-            if name.strip().lower() in self._MAMAD_NAMES:
+            if self._is_mamad_room(name):
                 log.debug("Room '%s' excluded (mamad/safe room)", name)
                 continue
             # Check user exclusion list

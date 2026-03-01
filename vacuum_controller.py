@@ -196,10 +196,22 @@ class VacuumController:
             "result": result,
         }
 
-    async def start_segment_clean(self, segment_id: int, fan_speed: str = "balanced") -> None:
+    async def start_segment_clean(
+        self,
+        segment_id: int,
+        fan_speed: str = "balanced",
+        cleaning_profile: str = "auto",
+    ) -> None:
         """Start cleaning a single segment (room)."""
         if self._device is None:
             raise RuntimeError("Call discover_devices() first")
+
+        profile = (cleaning_profile or "auto").strip().lower()
+        if profile != "auto":
+            log.info(
+                "Requested cleaning_profile=%s on Roborock; using device defaults with segment clean parameters",
+                profile,
+            )
 
         fan_speed_val = _FAN_SPEED_MAP.get(fan_speed.lower(), _FAN_SPEED_MAP["balanced"])
         params = [{"segments": [segment_id], "repeat": 1, "fan_speed": fan_speed_val}]
